@@ -1,0 +1,7 @@
+numpy>=2.0
+pandas>=2.2
+arch>=7.0
+lightgbm>=4.0
+scikit-learn>=1.5
+torch>=2.3
+pytest>=8.0
