@@ -1,0 +1,11 @@
+numpy>=2.0
+pandas>=2.2
+arch>=7.0
+lightgbm>=4.0
+scikit-learn>=1.5
+torch>=2.3
+pytest>=8.0
+requests>=2.31        # 노션 게시(volserve.notion_page)
+# 선택: 변동성 전망 리포트 에이전트(volserve.outlook_report)
+langgraph>=1.0
+anthropic>=2.0
