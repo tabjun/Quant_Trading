@@ -1,14 +1,19 @@
 """변동성 전망 리포트 에이전트: 에이전트 실행 결과를 요약해 Claude API에 보내는 LangGraph 상태 그래프.
 
-    불러온 실행 → 요약 → 요청 구성 → 차단 검사 ─┬─ 막힘 ──────────────┐
-                                               ├─ 시험(dry) ─────────┤
-                                               └─ 호출 → 응답 검사 ──┴→ 끝
+    불러온 실행 → 요약 → 요청 구성 → 차단 검사 → 호출 → 응답 검사 → 저장
+                          ↑                               │
+                          └── 숫자 대조 실패(최대 3회) ───┘
+
+    차단 검사에 걸리거나 시험(dry)이면 호출하지 않고 끝난다. 응답 검사를 끝내 통과하지 못하면 저장하지 않는다.
 
 - 요약에는 구간별 국면 종목 수, 쓴 모델 칸 수, 예측/직전 변동성 배율의 사분위, 배율 상위·하위 몇 종목의 배율·국면만 넣는다.
   원시 시세와 가격을 거꾸로 계산할 수 있는 촘촘한 시계열은 보내지 않는다.
 - 차단 검사(guard)는 보내기 직전 요청 본문에서 비밀값(환경 변수의 키·토큰 값), 키 모양 문자열, 원시 시세 항목 이름,
   가격 모양 큰 수, 촘촘한 연속 숫자, 지나친 크기를 찾고 하나라도 있으면 호출하지 않는다.
-- 판단은 위험 노출에 대한 셋 중 하나(유지·관망·축소)이고, 가격 방향은 말하지 않는다. 투자 권유가 아닌 참고용이다.
+- 판단(유지·관망·축소)은 고정 규칙으로 코드가 계산한다(`stance_detail`). LLM은 설명 문장 칸만 쓰고 판단 칸이 없다.
+- 응답 검사는 LLM이 쓴 문장의 숫자를 모두 입력 요약과 대조한다(`number_issues`). 맞지 않으면 지적 사항을 붙여 다시 생성하고
+  (첫 호출 포함 최대 3회), 그래도 맞지 않으면 리포트를 저장하지 않는다. 리포트 표·판단 값은 코드가 조립한다.
+- 가격 방향은 말하지 않는다. 투자 권유가 아닌 참고용이다.
 
 선택 의존성: langgraph, anthropic. API 키는 ANTHROPIC_API_KEY 환경 변수에서 읽는다.
 """
@@ -21,6 +26,7 @@ import re
 import statistics
 import time
 from collections import Counter
+from itertools import combinations
 from typing import Any, TypedDict
 
 from .agent import AgentRun, horizon_word
@@ -41,30 +47,79 @@ RAW_MARKET = re.compile(r"\b(?:open|high|low|close|volume|ohlcv?|candles?|orderb
                         r"ask_price|bid_price)\b", re.IGNORECASE)
 NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
 
-SYSTEM = """너는 암호화폐 변동성 예측 에이전트의 전망 리포트 작성자다. 입력은 에이전트가 만든 요약 집계뿐이다.
+EXPAND, SHRINK = 1.1, 0.9  # 배율 중앙값이 1.1을 넘으면 "커질 전망", 0.9 밑이면 "줄어들 전망"
+MAX_ATTEMPTS = 3  # 숫자 대조에 걸리면 지적 사항을 붙여 다시 생성하는 최대 횟수(첫 호출 포함)
+
+SYSTEM = """너는 암호화폐 변동성 예측 에이전트의 전망 리포트에서 설명 문장을 쓰는 사람이다. 입력은 에이전트가 만든 요약 집계와, 코드가 계산한 구간별 전망·판단("규칙 계산")뿐이다.
 - 국면 Q1~Q5: 직전 같은 길이 구간의 실현변동성이 학습 구간 분포의 5분위 중 어디인지다(Q1 잔잔, Q5 요동).
-- 배율: 예측 실현변동성 ÷ 직전 같은 길이 구간의 실현변동성이다.
-- 입력에 없는 수치·사건·가격을 만들지 않고, 가격 방향은 말하지 않는다.
-- 판단(stance)은 위험 노출에 대한 유지·관망·축소 중 하나다. 변동성 확대가 넓게 예상되면 보수적으로 고른다.
-- 한국어로 쓰고 참고용임을 밝힌다. report_markdown은 "## 한 줄 요약", "## 구간별 전망", "## 눈여겨볼 종목", "## 판단과 근거", "## 해석 유의점"으로 쓴다."""
+- 배율: 예측 실현변동성 ÷ 직전 같은 길이 구간의 실현변동성이다. 1.1보다 크면 커질 전망, 0.9보다 작으면 줄어들 전망이다.
+- 판단(유지·관망·축소)은 코드가 정했다. 판단을 바꾸거나 다른 판단을 권하지 않고, 왜 그 판단이 나왔는지 설명만 한다.
+- 판단 기준: 1) 축소: 4시간 또는 12시간의 배율 중앙값이 1.1을 넘고 그 구간에서 Q4+Q5 종목이 Q1+Q2 종목보다 많다. 2) 관망: 1이 아니고 배율 중앙값이 1.1을 넘는 구간이 3개 이상이다. 3) 유지: 그 밖.
+- 칸: market_state(지금 시장 상태 한두 문장), outlook_conclusion(앞으로 전망 결론 한 문장), outlook_points(근거 2~4개), stance_explanation(판단이 어떤 수치로 어떤 기준을 거쳐 나왔는지 2~3문장), caveats(유의점 2~4개).
+- 숫자는 입력 값을 그대로 쓴다. 반올림·새로 계산한 비율이나 평균은 쓰지 않는다. 같은 구간 국면 종목 수의 합, 종목 수에서 뺀 나머지만 예외다.
+- 입력에 없는 수치·사건·가격을 만들지 않고, 가격 방향은 말하지 않는다. 한국어로 쓰고 문장을 서술어로 끝맺는다. 참고용이며 투자 권유가 아니다."""
 
 SCHEMA = {"type": "object", "additionalProperties": False,
-          "required": ["stance", "stance_reason", "report_markdown", "caveats"],
-          "properties": {"stance": {"type": "string", "enum": list(STANCES)}, "stance_reason": {"type": "string"},
-                         "report_markdown": {"type": "string"}, "caveats": {"type": "array", "items": {"type": "string"}}}}
+          "required": ["market_state", "outlook_conclusion", "outlook_points", "stance_explanation", "caveats"],
+          "properties": {"market_state": {"type": "string"}, "outlook_conclusion": {"type": "string"},
+                         "outlook_points": {"type": "array", "items": {"type": "string"}},
+                         "stance_explanation": {"type": "string"}, "caveats": {"type": "array", "items": {"type": "string"}}}}
+TEXT_FIELDS = ("market_state", "outlook_conclusion", "stance_explanation")
+LIST_FIELDS = ("outlook_points", "caveats")
 
 
 class ReportState(TypedDict, total=False):
     run: AgentRun
     dry: bool
+    save_dir: str  # 주면 성공한 리포트만 여기에 쓴다(실패하면 아무것도 쓰지 않는다)
+    attempt: int
+    feedback: list
     summary: dict
     request: dict
     guard: dict
     response: dict
     report: dict
-    status: str  # dry | blocked | ok | refused | error
+    status: str  # dry | blocked | retry | ok | refused | error
     error: str
+    saved: str
 
+
+# ---------------------------------------------------------------- 판단 규칙(코드 계산)
+
+def _median_ratio(d: dict) -> float | None:
+    q = d.get("배율 사분위(25%·중앙·75%)") or []
+    return q[1] if len(q) == 3 else None
+
+
+def direction(d: dict) -> str:
+    m = _median_ratio(d)
+    if m is None:
+        return "알 수 없음"
+    return "커질 전망" if m > EXPAND else "줄어들 전망" if m < SHRINK else "비슷할 전망"
+
+
+def _regime_groups(d: dict) -> tuple[int, int, int]:
+    """국면 종목 수 → (잔잔 Q1+Q2, 보통 Q3, 요동 Q4+Q5)."""
+    c = d["국면 종목 수"]
+    return c.get("Q1", 0) + c.get("Q2", 0), c.get("Q3", 0), c.get("Q4", 0) + c.get("Q5", 0)
+
+
+def stance_detail(summary: dict) -> dict:
+    """판단 기준(1 축소 → 2 관망 → 3 유지)을 위에서부터 적용한 결과와 근거. LLM은 이 값을 바꾸지 못한다."""
+    seg = summary["구간"]
+    expanding = [h for h, d in seg.items() if (m := _median_ratio(d)) is not None and m > EXPAND]
+    high = [h for h, d in seg.items() if _regime_groups(d)[2] > _regime_groups(d)[0]]
+    hit = [h for h in ("4시간", "12시간") if h in expanding and h in high]
+    stance, rule = ("축소", 1) if hit else ("관망", 2) if len(expanding) >= 3 else ("유지", 3)
+    return {"판단": stance, "맞은 기준": rule, "확대 구간": expanding, "높은 국면 우세 구간": high,
+            "축소 기준에 걸린 구간": hit, "구간별 전망": {h: direction(d) for h, d in seg.items()}}
+
+
+def rule_stance(summary: dict) -> str:
+    return stance_detail(summary)["판단"]
+
+
+# ---------------------------------------------------------------- 요약·요청
 
 def summarize(run: AgentRun, top_n: int = TOP_N) -> dict:
     out: dict[str, Any] = {"기준 시각": str(run.as_of)[:16], "종목 수": len({c.ticker for c in run.cells}), "구간": {}}
@@ -80,18 +135,77 @@ def summarize(run: AgentRun, top_n: int = TOP_N) -> dict:
         out["구간"][horizon_word(h)] = {
             "국면 종목 수": dict(sorted(Counter(f"Q{c.route.regime}" for c in cs).items())),
             "쓴 모델": dict(Counter(c.route.research_model for c in cs).most_common()),
+            "배율 계산된 종목 수": len(vals),  # 직전 변동성이 0이면 배율을 못 구한다
             "배율 사분위(25%·중앙·75%)": [round(x, 2) for x in q],
-            "배율 1.1 초과 종목 수": sum(r > 1.1 for r in vals),
-            "배율 0.9 미만 종목 수": sum(r < 0.9 for r in vals),
+            "배율 1.1 초과 종목 수": sum(r > EXPAND for r in vals),
+            "배율 0.9 미만 종목 수": sum(r < SHRINK for r in vals),
             "배율 상위": [pick(r, c) for r, c in rs[::-1][:top_n]],
             "배율 하위": [pick(r, c) for r, c in rs[:top_n]],
         }
+    out["규칙 계산"] = stance_detail(out)  # 판단은 코드가 정하고 LLM은 설명만 한다
     return out
 
 
-def compose(summary: dict) -> dict:
-    user = "다음 요약만 근거로 변동성 전망 리포트와 위험 노출 판단을 써라.\n\n```json\n" + json.dumps(summary, ensure_ascii=False) + "\n```"
+def compose(summary: dict, feedback: list | None = None) -> dict:
+    user = ("다음은 요약 집계와 코드가 계산한 구간별 전망·판단(\"규칙 계산\")이다. 이것만 근거로 설명 문장 칸을 채워라.\n\n```json\n"
+            + json.dumps(summary, ensure_ascii=False) + "\n```")
+    if feedback:
+        user += ("\n\n직전 응답의 숫자가 입력과 맞지 않아 다시 요청한다. 다음을 고쳐서 처음부터 다시 써라: " + "; ".join(feedback)
+                 + ". 입력에 있는 값만 그대로 쓴다. 이 지적 자체는 어느 칸에도 쓰지 않는다.")
     return {"model": MODEL, "system": SYSTEM, "user": user}
+
+
+# ---------------------------------------------------------------- 숫자 전수 대조
+
+DATETIME = re.compile(r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?|\b\d{2}:\d{2}\b")
+
+
+def _numbers(text: str) -> list[float]:
+    """글 속 숫자(날짜·시각은 빼고, 부호는 무시)."""
+    return [abs(float(n)) for n in NUMBER.findall(DATETIME.sub(" ", text))]
+
+
+def number_issues(text: str, summary: dict, system: str = SYSTEM) -> list[str]:
+    """LLM이 쓴 글의 숫자가 모두 입력 요약(또는 지시문)에서 나온 값인지 본다. 같은 구간 국면 종목 수·모델 칸 수의 부분합과
+    종목 수에서 뺀 나머지는 허용한다. 빈 값 표기(null·None·NaN)도 잡는다."""
+    allowed = set(_numbers(json.dumps(summary, ensure_ascii=False))) | set(_numbers(system))
+    n_tk = float(summary.get("종목 수") or 0)
+    for d in summary["구간"].values():
+        for group in (list(d["국면 종목 수"].values()), list(d["쓴 모델"].values())):
+            for r in range(1, len(group) + 1):
+                for c in combinations(group, r):
+                    allowed |= {float(sum(c)), n_tk - sum(c)}
+    issues = [f"빈 값 표기({m.group()})" for m in re.finditer(r"(?<![A-Za-z])(?:null|None|NaN|nan)(?![A-Za-z])", text)]
+    issues += [f"입력에 없는 수 {n:g}" for n in sorted({x for x in _numbers(text) if not any(abs(x - a) < 1e-9 for a in allowed)})]
+    return issues
+
+
+# ---------------------------------------------------------------- 리포트 조립(코드)
+
+def _table(header: list[str], rows: list[list]) -> str:
+    return "\n".join(["| " + " | ".join(header) + " |", "|" + " :--- |" * len(header)]
+                     + ["| " + " | ".join(str(c) for c in r) + " |" for r in rows])
+
+
+def render_markdown(summary: dict, rep: dict) -> str:
+    """고정 형식: 예측값 요약 → 1 지금 시장 상태 → 2 현재 전망 → 3 판단(규칙 계산) → 4 유의점.
+    표·판단 값은 코드가 쓰고, LLM 문장 칸만 끼워 넣는다."""
+    seg, det = summary["구간"], summary["규칙 계산"]
+
+    def med(d):
+        m = _median_ratio(d)
+        return f"{m:.2f}" if m is not None else "계산 안 됨"
+
+    return "\n".join([
+        "## 예측값 요약", _table(["구간", "직전 대비 배율(중앙값)", "전망"], [[h, med(d), det["구간별 전망"][h]] for h, d in seg.items()]), "",
+        "## 1. 지금 시장 상태", rep["market_state"].strip(), "",
+        _table(["구간", "잔잔(Q1·Q2)", "보통(Q3)", "요동(Q4·Q5)"], [[h, *_regime_groups(d)] for h, d in seg.items()]), "",
+        "## 2. 현재 전망", f"**{rep['outlook_conclusion'].strip()}**", "", *[f"- {x.strip()}" for x in rep["outlook_points"]], "",
+        f"## 3. 판단: {det['판단']} (규칙 계산)", f"맞은 기준: {det['맞은 기준']}번 · 확대 구간: {', '.join(det['확대 구간']) or '없음'}", "",
+        rep["stance_explanation"].strip(), "",
+        "## 4. 유의점", *[f"- {x.strip()}" for x in rep["caveats"]],
+        "- 판단은 정해진 기준을 코드로 계산한 값이고, 문장은 LLM이 그 계산을 설명한 것이다. 가격 방향은 다루지 않으며 투자 권유가 아니다.",
+    ]).strip()
 
 
 def _long_runs(obj: Any, limit: int) -> list[int]:
@@ -135,8 +249,11 @@ def guard(request: dict, summary: dict, environ: dict | None = None) -> dict:
 
 
 def _node_summarize(st: ReportState) -> ReportState:
-    s = summarize(st["run"])
-    return {"summary": s, "request": compose(s)}
+    return {"summary": summarize(st["run"])}
+
+
+def _node_compose(st: ReportState) -> ReportState:
+    return {"request": compose(st["summary"], st.get("feedback")), "attempt": int(st.get("attempt") or 0) + 1}
 
 
 def _node_guard(st: ReportState) -> ReportState:
@@ -146,12 +263,10 @@ def _node_guard(st: ReportState) -> ReportState:
     return {"guard": g, "status": "dry" if st.get("dry") else "call"}
 
 
-def _node_call(st: ReportState) -> ReportState:
+def call_claude(req: dict) -> dict:
+    """Claude API를 한 번 부른다. 시험에서는 write_report(call=...)로 가짜 응답 함수를 넣어 네트워크를 쓰지 않는다."""
     import anthropic
 
-    req = st["request"]
-    if guard(req, st["summary"])["sha256"] != st["guard"]["sha256"]:
-        return {"status": "blocked", "error": "차단 검사 뒤 요청 본문이 바뀌었다"}
     client = anthropic.Anthropic(timeout=300.0, max_retries=2)
     t0 = time.monotonic()
     try:
@@ -160,19 +275,30 @@ def _node_call(st: ReportState) -> ReportState:
             system=req["system"], messages=[{"role": "user", "content": req["user"]}],
             output_config={"effort": EFFORT, "format": {"type": "json_schema", "schema": SCHEMA}})
     except anthropic.AuthenticationError as e:
-        return {"status": "error", "error": f"인증 실패: {e.status_code}"}
+        return {"error": f"인증 실패: {e.status_code}"}
     except anthropic.RateLimitError as e:
-        return {"status": "error", "error": f"사용량 한도: {e.status_code}"}
+        return {"error": f"사용량 한도: {e.status_code}"}
     except anthropic.APIStatusError as e:
-        return {"status": "error", "error": f"API 오류 {e.status_code}"}
+        return {"error": f"API 오류 {e.status_code}"}
     except anthropic.APIConnectionError as e:
-        return {"status": "error", "error": f"연결 실패: {type(e).__name__}"}
+        return {"error": f"연결 실패: {type(e).__name__}"}
     u = resp.usage
-    return {"response": {
-        "requested_model": req["model"], "served_model": resp.model, "stop_reason": resp.stop_reason,
-        "usage": {k: getattr(u, k, None) for k in ("input_tokens", "output_tokens", "cache_read_input_tokens")},
-        "elapsed_s": round(time.monotonic() - t0, 2), "request_id": getattr(resp, "_request_id", None),
-        "text": next((b.text for b in resp.content if b.type == "text"), "")}}
+    return {"requested_model": req["model"], "served_model": resp.model, "stop_reason": resp.stop_reason,
+            "usage": {k: getattr(u, k, None) for k in ("input_tokens", "output_tokens", "cache_read_input_tokens")},
+            "elapsed_s": round(time.monotonic() - t0, 2), "request_id": getattr(resp, "_request_id", None),
+            "text": next((b.text for b in resp.content if b.type == "text"), "")}
+
+
+def _make_call_node(call):
+    def _node_call(st: ReportState) -> ReportState:
+        req = st["request"]
+        if guard(req, st["summary"])["sha256"] != st["guard"]["sha256"]:
+            return {"status": "blocked", "error": "차단 검사 뒤 요청 본문이 바뀌었다"}
+        r = call(req)
+        if "error" in r:
+            return {"status": "error", "error": r["error"]}
+        return {"response": r}
+    return _node_call
 
 
 def _node_check(st: ReportState) -> ReportState:
@@ -185,25 +311,52 @@ def _node_check(st: ReportState) -> ReportState:
         rep = json.loads(r["text"])
     except json.JSONDecodeError:
         return {"status": "error", "error": "응답이 JSON이 아니다"}
-    if rep.get("stance") not in STANCES:
-        return {"status": "error", "error": "판단 값이 없다"}
-    return {"report": rep, "status": "ok"}
+    if (any(not str(rep.get(k) or "").strip() for k in TEXT_FIELDS)
+            or any(not isinstance(rep.get(k), list) or not rep[k] for k in LIST_FIELDS)):
+        return {"status": "error", "error": "설명 칸이 비었다"}
+    text = "\n".join([*(rep[k] for k in TEXT_FIELDS), *rep["outlook_points"], *rep["caveats"]])
+    if issues := number_issues(text, st["summary"]):
+        if int(st.get("attempt") or 1) < MAX_ATTEMPTS:
+            return {"status": "retry", "feedback": issues[:12], "response": None}
+        return {"status": "error", "error": f"{MAX_ATTEMPTS}번 생성해도 숫자가 입력과 맞지 않음: " + ", ".join(issues[:12])}
+    det = st["summary"]["규칙 계산"]
+    report = {**rep, "stance": det["판단"], "stance_source": "규칙 계산", "stance_rule": det["맞은 기준"],
+              "report_markdown": render_markdown(st["summary"], rep)}
+    return {"report": report, "status": "ok", "feedback": []}
 
 
-def build_graph():
+def _node_save(st: ReportState) -> ReportState:
+    """성공한 리포트만 쓴다. 차단·거절·숫자 대조 실패면 아무것도 쓰지 않는다."""
+    if st.get("status") != "ok" or not st.get("save_dir"):
+        return {}
+    from pathlib import Path
+
+    p = Path(st["save_dir"]) / f"report_{str(st['summary']['기준 시각']).replace(' ', '_').replace(':', '')}.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(f"# 변동성 전망 리포트 ({st['summary']['기준 시각']} 기준)\n\n" + st["report"]["report_markdown"] + "\n")
+    return {"saved": str(p)}
+
+
+def build_graph(call=None):
+    """불러온 실행 → 요약 → 요청 구성 → 차단 검사 → 호출 → 응답 검사(숫자 대조 실패면 요청 구성으로 돌아가 재생성) → 저장."""
     from langgraph.graph import END, START, StateGraph
 
     g = StateGraph(ReportState)
-    for name, fn in (("summarize", _node_summarize), ("guard", _node_guard), ("call", _node_call), ("check", _node_check)):
+    for name, fn in (("summarize", _node_summarize), ("compose", _node_compose), ("guard", _node_guard),
+                     ("call", _make_call_node(call or call_claude)), ("check", _node_check), ("save", _node_save)):
         g.add_node(name, fn)
     g.add_edge(START, "summarize")
-    g.add_edge("summarize", "guard")
+    g.add_edge("summarize", "compose")
+    g.add_edge("compose", "guard")
     g.add_conditional_edges("guard", lambda st: "call" if st.get("status") == "call" else END, {"call": "call", END: END})
-    g.add_edge("call", "check")
-    g.add_edge("check", END)
+    g.add_conditional_edges("call", lambda st: "check" if st.get("response") else END, {"check": "check", END: END})
+    g.add_conditional_edges("check", lambda st: "compose" if st.get("status") == "retry" else "save",
+                            {"compose": "compose", "save": "save"})
+    g.add_edge("save", END)
     return g.compile()
 
 
-def write_report(run: AgentRun, dry: bool = True) -> ReportState:
-    """dry=True면 요약·차단 검사까지만 하고 보내지 않는다."""
-    return build_graph().invoke({"run": run, "dry": dry})
+def write_report(run: AgentRun, dry: bool = True, call=None, save_dir: str | None = None) -> ReportState:
+    """dry=True면 요약·차단 검사까지만 하고 보내지 않는다. call은 요청 → 응답 사전 함수(기본: Claude API).
+    save_dir를 주면 응답 검사를 통과한 리포트만 그 폴더에 쓴다."""
+    return build_graph(call).invoke({"run": run, "dry": dry, "save_dir": save_dir or ""})
