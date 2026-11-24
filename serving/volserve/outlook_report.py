@@ -6,11 +6,14 @@
 
     차단 검사에 걸리거나 시험(dry)이면 호출하지 않고 끝난다. 응답 검사를 끝내 통과하지 못하면 저장하지 않는다.
 
-- 요약에는 구간별 국면 종목 수, 쓴 모델 칸 수, 예측/직전 변동성 배율의 사분위, 배율 상위·하위 몇 종목의 배율·국면만 넣는다.
+- 요약에는 구간별 지금 국면·예측 국면 종목 수, 쓴 모델 칸 수, 예측/직전 변동성 배율의 사분위(참고), 배율 상위·하위 몇 종목의
+  배율·국면만 넣는다.
   원시 시세와 가격을 거꾸로 계산할 수 있는 촘촘한 시계열은 보내지 않는다.
 - 차단 검사(guard)는 보내기 직전 요청 본문에서 비밀값(환경 변수의 키·토큰 값), 키 모양 문자열, 원시 시세 항목 이름,
   가격 모양 큰 수, 촘촘한 연속 숫자, 지나친 크기를 찾고 하나라도 있으면 호출하지 않는다.
 - 판단(유지·관망·축소)은 고정 규칙으로 코드가 계산한다(`stance_detail`). LLM은 설명 문장 칸만 쓰고 판단 칸이 없다.
+  비교 기준은 바로 직전 구간이 아니라 평소다: 고정 GARCH-BIC 예측을 같은 모형이 학습 구간의 같은 시각에 낸 예측 분포와 비교한
+  예측 국면(Q1~Q5)으로 판단한다. 직전 대비 배율은 평균 회귀 때문에 직전이 잔잔하면 기계적으로 1을 넘기 쉬워 참고로만 둔다.
 - 응답 검사는 LLM이 쓴 문장의 숫자를 모두 입력 요약과 대조한다(`number_issues`). 맞지 않으면 지적 사항을 붙여 다시 생성하고
   (첫 호출 포함 최대 3회), 그래도 맞지 않으면 리포트를 저장하지 않는다. 리포트 표·판단 값은 코드가 조립한다.
 - 가격 방향은 말하지 않는다. 투자 권유가 아닌 참고용이다.
@@ -47,14 +50,15 @@ RAW_MARKET = re.compile(r"\b(?:open|high|low|close|volume|ohlcv?|candles?|orderb
                         r"ask_price|bid_price)\b", re.IGNORECASE)
 NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
 
-EXPAND, SHRINK = 1.1, 0.9  # 배율 중앙값이 1.1을 넘으면 "커질 전망", 0.9 밑이면 "줄어들 전망"
+EXPAND, SHRINK = 1.1, 0.9  # 참고: 배율 중앙값이 1.1을 넘으면 "직전보다 커질 전망", 0.9 밑이면 "줄어들 전망"
 MAX_ATTEMPTS = 3  # 숫자 대조에 걸리면 지적 사항을 붙여 다시 생성하는 최대 횟수(첫 호출 포함)
 
 SYSTEM = """너는 암호화폐 변동성 예측 에이전트의 전망 리포트에서 설명 문장을 쓰는 사람이다. 입력은 에이전트가 만든 요약 집계와, 코드가 계산한 구간별 전망·판단("규칙 계산")뿐이다.
-- 국면 Q1~Q5: 직전 같은 길이 구간의 실현변동성이 학습 구간 분포의 5분위 중 어디인지다(Q1 잔잔, Q5 요동).
-- 배율: 예측 실현변동성 ÷ 직전 같은 길이 구간의 실현변동성이다. 1.1보다 크면 커질 전망, 0.9보다 작으면 줄어들 전망이다.
+- 지금 국면 Q1~Q5: 직전 같은 길이 구간의 실현변동성이 학습 구간 분포의 5분위 중 어디인지다(Q1 잔잔, Q5 요동).
+- 예측 국면 Q1~Q5: 고정 GARCH-BIC 예측이 같은 모형으로 학습 구간(평소)의 같은 시각에 낸 예측값 분포의 5분위 중 어디인지다. 평소라면 Q1~Q5가 각각 20% 안팎이다. 미정은 같은 시각 학습 예측이 모자라 정하지 못한 칸이다.
+- 배율: 예측 실현변동성 ÷ 직전 같은 길이 구간의 실현변동성이다. 참고 정보일 뿐 판단 기준이 아니다. 직전이 잔잔하면 평균으로 되돌아가는 성질 때문에 기계적으로 1을 넘기 쉽다.
 - 판단(유지·관망·축소)은 코드가 정했다. 판단을 바꾸거나 다른 판단을 권하지 않고, 왜 그 판단이 나왔는지 설명만 한다.
-- 판단 기준: 1) 축소: 4시간 또는 12시간의 배율 중앙값이 1.1을 넘고 그 구간에서 Q4+Q5 종목이 Q1+Q2 종목보다 많다. 2) 관망: 1이 아니고 배율 중앙값이 1.1을 넘는 구간이 3개 이상이다. 3) 유지: 그 밖.
+- 판단 기준(평소 대비): 1) 축소: 4시간 또는 12시간에서 예측 국면 Q4+Q5 종목이 과반이다. 2) 관망: 1이 아니고 예측 국면 Q4+Q5 종목이 과반인 구간이 2개 이상이다. 3) 유지: 그 밖.
 - 칸: market_state(지금 시장 상태 한두 문장), outlook_conclusion(앞으로 전망 결론 한 문장), outlook_points(근거 2~4개), stance_explanation(판단이 어떤 수치로 어떤 기준을 거쳐 나왔는지 2~3문장), caveats(유의점 2~4개).
 - 숫자는 입력 값을 그대로 쓴다. 반올림·새로 계산한 비율이나 평균은 쓰지 않는다. 같은 구간 국면 종목 수의 합, 종목 수에서 뺀 나머지만 예외다.
 - 입력에 없는 수치·사건·가격을 만들지 않고, 가격 방향은 말하지 않는다. 한국어로 쓰고 문장을 서술어로 끝맺는다. 참고용이며 투자 권유가 아니다."""
@@ -92,10 +96,24 @@ def _median_ratio(d: dict) -> float | None:
 
 
 def direction(d: dict) -> str:
+    """참고: 직전 대비 배율 중앙값으로 본 방향."""
     m = _median_ratio(d)
     if m is None:
         return "알 수 없음"
     return "커질 전망" if m > EXPAND else "줄어들 전망" if m < SHRINK else "비슷할 전망"
+
+
+def _forecast_groups(d: dict) -> tuple[int, int, int, int]:
+    """예측 국면 종목 수 → (잔잔 Q1+Q2, 보통 Q3, 요동 Q4+Q5, 미정)."""
+    c = d.get("예측 국면 종목 수") or {}
+    return c.get("Q1", 0) + c.get("Q2", 0), c.get("Q3", 0), c.get("Q4", 0) + c.get("Q5", 0), c.get("미정", 0)
+
+
+def level_word(d: dict) -> str:
+    """평소 대비 전망: 예측 국면 Q4+Q5가 과반이면 높음, Q1+Q2가 과반이면 낮음, 그 밖은 평소 수준(미정도 분모에 넣는다)."""
+    lo, _, hi, _ = g = _forecast_groups(d)
+    n = sum(g)
+    return "평소보다 높을 전망" if hi * 2 > n else "평소보다 낮을 전망" if lo * 2 > n else "평소 수준 전망"
 
 
 def _regime_groups(d: dict) -> tuple[int, int, int]:
@@ -105,14 +123,15 @@ def _regime_groups(d: dict) -> tuple[int, int, int]:
 
 
 def stance_detail(summary: dict) -> dict:
-    """판단 기준(1 축소 → 2 관망 → 3 유지)을 위에서부터 적용한 결과와 근거. LLM은 이 값을 바꾸지 못한다."""
+    """판단 기준(1 축소 → 2 관망 → 3 유지)을 위에서부터 적용한 결과와 근거. LLM은 이 값을 바꾸지 못한다.
+    비교 기준은 평소다: 예측 국면 Q4+Q5가 과반인 구간을 센다(문턱은 결과를 보기 전에 고정)."""
     seg = summary["구간"]
-    expanding = [h for h, d in seg.items() if (m := _median_ratio(d)) is not None and m > EXPAND]
-    high = [h for h, d in seg.items() if _regime_groups(d)[2] > _regime_groups(d)[0]]
-    hit = [h for h in ("4시간", "12시간") if h in expanding and h in high]
-    stance, rule = ("축소", 1) if hit else ("관망", 2) if len(expanding) >= 3 else ("유지", 3)
-    return {"판단": stance, "맞은 기준": rule, "확대 구간": expanding, "높은 국면 우세 구간": high,
-            "축소 기준에 걸린 구간": hit, "구간별 전망": {h: direction(d) for h, d in seg.items()}}
+    high = [h for h, d in seg.items() if _forecast_groups(d)[2] * 2 > sum(_forecast_groups(d))]
+    hit = [h for h in ("4시간", "12시간") if h in high]
+    stance, rule = ("축소", 1) if hit else ("관망", 2) if len(high) >= 2 else ("유지", 3)
+    return {"판단": stance, "맞은 기준": rule, "요동 예측 우세 구간": high, "축소 기준에 걸린 구간": hit,
+            "구간별 전망": {h: level_word(d) for h, d in seg.items()},
+            "참고: 직전 대비 방향": {h: direction(d) for h, d in seg.items()}}
 
 
 def rule_stance(summary: dict) -> str:
@@ -134,6 +153,7 @@ def summarize(run: AgentRun, top_n: int = TOP_N) -> dict:
 
         out["구간"][horizon_word(h)] = {
             "국면 종목 수": dict(sorted(Counter(f"Q{c.route.regime}" for c in cs).items())),
+            "예측 국면 종목 수": dict(sorted(Counter(f"Q{c.forecast_regime}" if c.forecast_regime else "미정" for c in cs).items())),
             "쓴 모델": dict(Counter(c.route.research_model for c in cs).most_common()),
             "배율 계산된 종목 수": len(vals),  # 직전 변동성이 0이면 배율을 못 구한다
             "배율 사분위(25%·중앙·75%)": [round(x, 2) for x in q],
@@ -166,12 +186,12 @@ def _numbers(text: str) -> list[float]:
 
 
 def number_issues(text: str, summary: dict, system: str = SYSTEM) -> list[str]:
-    """LLM이 쓴 글의 숫자가 모두 입력 요약(또는 지시문)에서 나온 값인지 본다. 같은 구간 국면 종목 수·모델 칸 수의 부분합과
+    """LLM이 쓴 글의 숫자가 모두 입력 요약(또는 지시문)에서 나온 값인지 본다. 같은 구간 지금·예측 국면 종목 수와 모델 칸 수의 부분합과
     종목 수에서 뺀 나머지는 허용한다. 빈 값 표기(null·None·NaN)도 잡는다."""
     allowed = set(_numbers(json.dumps(summary, ensure_ascii=False))) | set(_numbers(system))
     n_tk = float(summary.get("종목 수") or 0)
     for d in summary["구간"].values():
-        for group in (list(d["국면 종목 수"].values()), list(d["쓴 모델"].values())):
+        for group in (list(d["국면 종목 수"].values()), list(d.get("예측 국면 종목 수", {}).values()), list(d["쓴 모델"].values())):
             for r in range(1, len(group) + 1):
                 for c in combinations(group, r):
                     allowed |= {float(sum(c)), n_tk - sum(c)}
@@ -196,12 +216,19 @@ def render_markdown(summary: dict, rep: dict) -> str:
         m = _median_ratio(d)
         return f"{m:.2f}" if m is not None else "계산 안 됨"
 
+    def groups(d):
+        lo, mid, hi, und = _forecast_groups(d)
+        return f"{lo} / {mid} / {hi}" + (f" (미정 {und})" if und else "")
+
     return "\n".join([
-        "## 예측값 요약", _table(["구간", "직전 대비 배율(중앙값)", "전망"], [[h, med(d), det["구간별 전망"][h]] for h, d in seg.items()]), "",
+        "## 예측값 요약",
+        _table(["구간", "예측 국면 잔잔/보통/요동", "평소 대비 전망", "직전 대비 배율(참고)"],
+               [[h, groups(d), det["구간별 전망"][h], med(d)] for h, d in seg.items()]), "",
         "## 1. 지금 시장 상태", rep["market_state"].strip(), "",
         _table(["구간", "잔잔(Q1·Q2)", "보통(Q3)", "요동(Q4·Q5)"], [[h, *_regime_groups(d)] for h, d in seg.items()]), "",
         "## 2. 현재 전망", f"**{rep['outlook_conclusion'].strip()}**", "", *[f"- {x.strip()}" for x in rep["outlook_points"]], "",
-        f"## 3. 판단: {det['판단']} (규칙 계산)", f"맞은 기준: {det['맞은 기준']}번 · 확대 구간: {', '.join(det['확대 구간']) or '없음'}", "",
+        f"## 3. 판단: {det['판단']} (규칙 계산)",
+        f"맞은 기준: {det['맞은 기준']}번 · 평소보다 높을 예측이 과반인 구간: {', '.join(det['요동 예측 우세 구간']) or '없음'}", "",
         rep["stance_explanation"].strip(), "",
         "## 4. 유의점", *[f"- {x.strip()}" for x in rep["caveats"]],
         "- 판단은 정해진 기준을 코드로 계산한 값이고, 문장은 LLM이 그 계산을 설명한 것이다. 가격 방향은 다루지 않으며 투자 권유가 아니다.",

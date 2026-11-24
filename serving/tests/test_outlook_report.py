@@ -13,27 +13,35 @@ from volserve.routing import route
 HORIZONS = (15, 30, 60, 240, 720)
 
 
-def make_run(ratio_by_h: dict[int, float], regimes: tuple[int, ...]) -> AgentRun:
-    """종목 수 = len(regimes). 구간 h의 모든 종목 배율을 ratio_by_h[h] 근처(±0.05)로 둔 합성 실행."""
+def make_run(ratio_by_h: dict[int, float], regimes: tuple[int, ...], forecast: dict[int, tuple] | None = None) -> AgentRun:
+    """종목 수 = len(regimes). 구간 h의 모든 종목 배율을 ratio_by_h[h] 근처(±0.05)로, 예측 국면을 forecast[h]로 둔 합성 실행."""
     cells = []
     for h in HORIZONS:
+        fq = (forecast or {}).get(h, regimes)
         for i, q in enumerate(regimes):
             prev = 0.01 + 0.001 * i
             r = ratio_by_h[h] + (i - (len(regimes) - 1) / 2) * 0.05 / max(len(regimes) - 1, 1)
-            cells.append(Cell(ticker=f"T{i}", route=route(h, q), rv=prev * r, prev_rv=prev))
+            cells.append(Cell(ticker=f"T{i}", route=route(h, q), rv=prev * r, prev_rv=prev, forecast_regime=fq[i]))
     return AgentRun(as_of=pd.Timestamp("2024-01-01 06:00"), cells=cells)
 
 
 CALM, WILD = (1, 1, 2, 2, 3), (5, 5, 4, 4, 3)
+HIGH = (5, 5, 4, 3, 2)  # 예측 국면 Q4+Q5가 5종목 중 3(과반)
+UNDECIDED = (5, 4, None, None, None)  # 미정도 분모에 들어가 2/5는 과반이 아니다
 
 
-@pytest.mark.parametrize("ratios, regimes, stance, rule", [
-    ({15: 1.0, 30: 1.0, 60: 1.0, 240: 1.5, 720: 1.0}, WILD, "축소", 1),   # 4시간 확대 + 요동 우세
-    ({15: 1.5, 30: 1.5, 60: 1.5, 240: 1.5, 720: 1.0}, CALM, "관망", 2),   # 확대 4구간, 잔잔 우세라 축소 아님
-    ({15: 1.5, 30: 1.0, 60: 1.0, 240: 1.0, 720: 0.8}, CALM, "유지", 3),   # 확대 1구간
+FLAT = {h: 1.0 for h in HORIZONS}
+UP = {h: 1.5 for h in HORIZONS}
+
+
+@pytest.mark.parametrize("ratios, forecast, stance, rule", [
+    (FLAT, {15: CALM, 30: CALM, 60: CALM, 240: HIGH, 720: CALM}, "축소", 1),   # 4시간 예측 Q4+Q5 과반
+    (FLAT, {15: HIGH, 30: HIGH, 60: CALM, 240: CALM, 720: CALM}, "관망", 2),   # 과반 구간 2개, 긴 구간은 아님
+    (UP, {h: CALM for h in HORIZONS}, "유지", 3),                               # 배율이 모두 1.5여도 판단에는 쓰지 않는다
+    (FLAT, {15: HIGH, 30: CALM, 60: CALM, 240: UNDECIDED, 720: CALM}, "유지", 3),  # 미정이 섞여 과반 아님
 ])
-def test_stance_is_computed_by_code(ratios, regimes, stance, rule):
-    s = summarize(make_run(ratios, regimes))
+def test_stance_is_computed_by_code(ratios, forecast, stance, rule):
+    s = summarize(make_run(ratios, CALM, forecast))
     det = stance_detail(s)
     assert (det["판단"], det["맞은 기준"]) == (stance, rule) and rule_stance(s) == stance
     assert s["규칙 계산"]["판단"] == stance  # LLM에 보내는 요약에도 코드 판단이 들어간다
@@ -41,10 +49,11 @@ def test_stance_is_computed_by_code(ratios, regimes, stance, rule):
 
 
 def test_number_check_allows_input_values_and_sums_only():
-    s = summarize(make_run({h: 1.5 for h in HORIZONS}, CALM))
+    s = summarize(make_run(UP, CALM, {h: HIGH for h in HORIZONS}))
     seg = s["구간"]["15분"]
     calm = seg["국면 종목 수"].get("Q1", 0) + seg["국면 종목 수"].get("Q2", 0)
-    ok = f"15분 배율 중앙값은 {seg['배율 사분위(25%·중앙·75%)'][1]}이고 잔잔한 종목은 {calm}개다."
+    high = seg["예측 국면 종목 수"].get("Q4", 0) + seg["예측 국면 종목 수"].get("Q5", 0)
+    ok = f"15분 배율 중앙값은 {seg['배율 사분위(25%·중앙·75%)'][1]}이고 잔잔한 종목은 {calm}개, 평소보다 높을 예측은 {high}개다."
     assert number_issues(ok, s) == []
     for bad in ("배율 중앙값은 7.77배다.", "구분 안 됨 수는 null이다."):
         assert number_issues(bad, s), bad
@@ -55,8 +64,8 @@ def fake_response(text_fields: dict) -> dict:
             "request_id": None, "text": json.dumps(text_fields, ensure_ascii=False)}
 
 
-GOOD = {"market_state": "대부분 종목이 잔잔하다.", "outlook_conclusion": "다섯 구간 중 네 구간이 커질 전망이다.",
-        "outlook_points": ["짧은 구간 배율 중앙값이 기준을 넘는다."], "stance_explanation": "기준 2에 맞아 관망이다.",
+GOOD = {"market_state": "대부분 종목이 잔잔하다.", "outlook_conclusion": "짧은 두 구간에서 평소보다 높을 전망이다.",
+        "outlook_points": ["15분과 30분에서 예측 국면 Q4·Q5가 과반이다."], "stance_explanation": "기준 2에 맞아 관망이다.",
         "caveats": ["합성 자료다."]}
 BAD = {**GOOD, "stance_explanation": "배율이 7.77배라서 관망이다."}
 
@@ -75,7 +84,7 @@ class FakeClaude:
 @pytest.fixture
 def run():
     pytest.importorskip("langgraph")
-    return make_run({15: 1.5, 30: 1.5, 60: 1.5, 240: 1.5, 720: 1.0}, CALM)
+    return make_run(FLAT, CALM, {15: HIGH, 30: HIGH, 60: CALM, 240: CALM, 720: CALM})
 
 
 def test_ok_report_uses_code_stance_and_is_saved(run, tmp_path):

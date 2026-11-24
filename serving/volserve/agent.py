@@ -34,6 +34,7 @@ class Cell:
     route: Route
     rv: float            # 다음 H분 실현변동성 예측
     prev_rv: float       # 직전 H분 실현변동성
+    forecast_regime: int | None = None  # 예측 국면 1–5(평소 대비, 고정 GARCH-BIC 기준). None이면 미정
     explanation: str = ""
 
 
@@ -96,7 +97,7 @@ class RegimeRoutingAgent:
             fc = self.services_[tk].predict(returns_by_ticker[tk], h)
             if fc.model != rt.served_model or fc.regime != rt.regime:
                 raise RuntimeError(f"{tk} {h}분: 라우터와 예측 모델이 어긋났다")
-            cells.append(Cell(tk, rt, fc.rv, regimes[tk, h][1]))
+            cells.append(Cell(tk, rt, fc.rv, regimes[tk, h][1], forecast_regime=fc.forecast_regime))
         lap(STAGES[3])
         for c in cells:                                      # 5 설명 생성
             c.explanation = explain(c)

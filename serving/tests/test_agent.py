@@ -20,11 +20,33 @@ def test_route_table_covers_every_cell():
 
 
 @pytest.fixture(scope="module")
-def run():
+def fitted():
     data = {f"T{i}": synthetic_returns(n=9_000, seed=i) for i in range(3)}
     train = {k: v.iloc[:8_000] for k, v in data.items()}
-    agent = RegimeRoutingAgent(horizons=HORIZONS, gru_kwargs={"epochs": 2, "device": "cpu"}).fit(train)
+    return RegimeRoutingAgent(horizons=HORIZONS, gru_kwargs={"epochs": 2, "device": "cpu"}).fit(train), data, train
+
+
+@pytest.fixture(scope="module")
+def run(fitted):
+    agent, data, _ = fitted
     return agent.run(data)
+
+
+def test_forecast_regime_compares_with_same_hour_training_forecasts(fitted, run):
+    """판단 기준(평소 대비): 학습 구간의 같은 시각 GARCH-BIC 예측을 그 경계에 다시 넣으면 각 5분위가 20% 안팎이어야 한다."""
+    agent, _, train = fitted
+    svc = agent.services_["T0"]
+    for h in HORIZONS:
+        bars = h // 15
+        pos = np.arange(673, len(train["T0"]) - bars + 1)
+        rv = np.sqrt(svc.garch_.predict_variance_path(train["T0"], bars, pos))
+        hours = train["T0"].index[pos].hour
+        hr = 6
+        edges = svc.forecast_edges_[h][hr]
+        share = np.bincount(np.digitize(rv[hours == hr], edges), minlength=5) / (hours == hr).sum()
+        assert np.allclose(share, 0.2, atol=0.03), share
+    assert all(c.forecast_regime is None or 1 <= c.forecast_regime <= 5 for c in run.cells)
+    assert any(c.forecast_regime is not None for c in run.cells)
 
 
 def test_agent_runs_every_cell(run):
