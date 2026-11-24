@@ -26,8 +26,10 @@ def make_run(ratio_by_h: dict[int, float], regimes: tuple[int, ...], forecast: d
 
 
 CALM, WILD = (1, 1, 2, 2, 3), (5, 5, 4, 4, 3)
-HIGH = (5, 5, 4, 3, 2)  # 예측 국면 Q4+Q5가 5종목 중 3(과반)
-UNDECIDED = (5, 4, None, None, None)  # 미정도 분모에 들어가 2/5는 과반이 아니다
+HIGH = (5, 5, 4, 3, 2)  # 예측 국면 Q4+Q5가 5종목 중 3(0.6, 관망 문턱과 같아 넘지 않는다)
+WATCH = (4, 4, 4, 5, 2)  # Q4+Q5 4/5 = 0.8, Q5 1/5
+SHRINK_Q5 = (5, 5, 5, 1, 1)  # Q5 3/5 = 0.6 > 0.5
+UNDECIDED = (5, 5, None, None, None)  # 미정도 분모에 들어가 Q5 2/5는 과반이 아니다
 
 
 FLAT = {h: 1.0 for h in HORIZONS}
@@ -35,10 +37,13 @@ UP = {h: 1.5 for h in HORIZONS}
 
 
 @pytest.mark.parametrize("ratios, forecast, stance, rule", [
-    (FLAT, {15: CALM, 30: CALM, 60: CALM, 240: HIGH, 720: CALM}, "축소", 1),   # 4시간 예측 Q4+Q5 과반
-    (FLAT, {15: HIGH, 30: HIGH, 60: CALM, 240: CALM, 720: CALM}, "관망", 2),   # 과반 구간 2개, 긴 구간은 아님
-    (UP, {h: CALM for h in HORIZONS}, "유지", 3),                               # 배율이 모두 1.5여도 판단에는 쓰지 않는다
-    (FLAT, {15: HIGH, 30: CALM, 60: CALM, 240: UNDECIDED, 720: CALM}, "유지", 3),  # 미정이 섞여 과반 아님
+    (FLAT, {15: CALM, 30: CALM, 60: CALM, 240: SHRINK_Q5, 720: CALM}, "축소", 1),  # 4시간 표 Q5 과반
+    (FLAT, {15: CALM, 30: CALM, 60: CALM, 240: WATCH, 720: CALM}, "관망", 2),      # 4시간 Q4+Q5 0.8, Q5는 과반 아님
+    (FLAT, {15: WATCH, 30: WATCH, 60: WATCH, 240: CALM, 720: CALM}, "관망", 2),    # 단기 표 12/15
+    (FLAT, {15: WATCH, 30: WATCH, 60: CALM, 240: CALM, 720: CALM}, "유지", 3),     # 짧은 두 구간만 높으면 단기 표 8/15 = 0.53
+    (FLAT, {15: CALM, 30: CALM, 60: CALM, 240: HIGH, 720: CALM}, "유지", 3),       # 0.6은 관망 문턱을 넘지 않는다
+    (UP, {h: CALM for h in HORIZONS}, "유지", 3),                                  # 배율이 모두 1.5여도 판단에는 쓰지 않는다
+    (FLAT, {15: CALM, 30: CALM, 60: CALM, 240: UNDECIDED, 720: CALM}, "유지", 3),  # 미정이 섞여 Q5 2/5
 ])
 def test_stance_is_computed_by_code(ratios, forecast, stance, rule):
     s = summarize(make_run(ratios, CALM, forecast))
@@ -64,8 +69,8 @@ def fake_response(text_fields: dict) -> dict:
             "request_id": None, "text": json.dumps(text_fields, ensure_ascii=False)}
 
 
-GOOD = {"market_state": "대부분 종목이 잔잔하다.", "outlook_conclusion": "짧은 두 구간에서 평소보다 높을 전망이다.",
-        "outlook_points": ["15분과 30분에서 예측 국면 Q4·Q5가 과반이다."], "stance_explanation": "기준 2에 맞아 관망이다.",
+GOOD = {"market_state": "대부분 종목이 잔잔하다.", "outlook_conclusion": "짧은 세 구간에서 평소보다 높을 전망이다.",
+        "outlook_points": ["15분·30분·1시간에서 예측 국면 Q4·Q5가 과반이다."], "stance_explanation": "기준 2에 맞아 관망이다.",
         "caveats": ["합성 자료다."]}
 BAD = {**GOOD, "stance_explanation": "배율이 7.77배라서 관망이다."}
 
@@ -84,7 +89,7 @@ class FakeClaude:
 @pytest.fixture
 def run():
     pytest.importorskip("langgraph")
-    return make_run(FLAT, CALM, {15: HIGH, 30: HIGH, 60: CALM, 240: CALM, 720: CALM})
+    return make_run(FLAT, CALM, {15: WATCH, 30: WATCH, 60: WATCH, 240: CALM, 720: CALM})
 
 
 def test_ok_report_uses_code_stance_and_is_saved(run, tmp_path):

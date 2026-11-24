@@ -58,7 +58,7 @@ SYSTEM = """너는 암호화폐 변동성 예측 에이전트의 전망 리포�
 - 예측 국면 Q1~Q5: 고정 GARCH-BIC 예측이 같은 모형으로 학습 구간(평소)의 같은 시각에 낸 예측값 분포의 5분위 중 어디인지다. 평소라면 Q1~Q5가 각각 20% 안팎이다. 미정은 같은 시각 학습 예측이 모자라 정하지 못한 칸이다.
 - 배율: 예측 실현변동성 ÷ 직전 같은 길이 구간의 실현변동성이다. 참고 정보일 뿐 판단 기준이 아니다. 직전이 잔잔하면 평균으로 되돌아가는 성질 때문에 기계적으로 1을 넘기 쉽다.
 - 판단(유지·관망·축소)은 코드가 정했다. 판단을 바꾸거나 다른 판단을 권하지 않고, 왜 그 판단이 나왔는지 설명만 한다.
-- 판단 기준(평소 대비): 1) 축소: 4시간 또는 12시간에서 예측 국면 Q4+Q5 종목이 과반이다. 2) 관망: 1이 아니고 예측 국면 Q4+Q5 종목이 과반인 구간이 2개 이상이다. 3) 유지: 그 밖.
+- 판단 기준(평소 대비, 표 세 개: 15분·30분·1시간을 합친 단기 표, 4시간, 12시간): 1) 축소: 4시간 또는 12시간 표에서 예측 국면 Q5 비율이 0.5를 넘는다. 2) 관망: 1이 아니고 어느 표든 예측 국면 Q4+Q5 비율이 0.6을 넘는다. 3) 유지: 그 밖.
 - 칸: market_state(지금 시장 상태 한두 문장), outlook_conclusion(앞으로 전망 결론 한 문장), outlook_points(근거 2~4개), stance_explanation(판단이 어떤 수치로 어떤 기준을 거쳐 나왔는지 2~3문장), caveats(유의점 2~4개).
 - 숫자는 입력 값을 그대로 쓴다. 반올림·새로 계산한 비율이나 평균은 쓰지 않는다. 같은 구간 국면 종목 수의 합, 종목 수에서 뺀 나머지만 예외다.
 - 입력에 없는 수치·사건·가격을 만들지 않고, 가격 방향은 말하지 않는다. 한국어로 쓰고 문장을 서술어로 끝맺는다. 참고용이며 투자 권유가 아니다."""
@@ -122,14 +122,37 @@ def _regime_groups(d: dict) -> tuple[int, int, int]:
     return c.get("Q1", 0) + c.get("Q2", 0), c.get("Q3", 0), c.get("Q4", 0) + c.get("Q5", 0)
 
 
+SHORT, LONG = ("15분", "30분", "1시간"), ("4시간", "12시간")
+# 문턱은 실시간 결과를 보기 전에 학습 구간에서만 정했다: 매일 같은 시각 판단 비율이 축소 10~15%, 관망 20~25%에 들도록
+# 과반(0.5)에서 시작해 정해 둔 격자 규칙으로 고른 값이다.
+P_SHRINK, P_WATCH = 0.5, 0.6
+
+
+def tables(seg: dict) -> dict[str, Counter]:
+    """예측 국면 칸 수를 표 세 개로 센다. 짧은 세 구간은 같은 조건부 분산에서 나온 거의 같은 신호라 한 표로 합친다."""
+    out: dict[str, Counter] = {}
+    short = Counter()
+    for h in SHORT:
+        short.update((seg.get(h) or {}).get("예측 국면 종목 수") or {})
+    if short:
+        out["단기"] = short
+    for h in LONG:
+        if h in seg:
+            out[h] = Counter(seg[h].get("예측 국면 종목 수") or {})
+    return out
+
+
 def stance_detail(summary: dict) -> dict:
     """판단 기준(1 축소 → 2 관망 → 3 유지)을 위에서부터 적용한 결과와 근거. LLM은 이 값을 바꾸지 못한다.
-    비교 기준은 평소다: 예측 국면 Q4+Q5가 과반인 구간을 센다(문턱은 결과를 보기 전에 고정)."""
+    비교 기준은 평소다. 비율의 분모에는 미정 칸도 넣는다."""
     seg = summary["구간"]
-    high = [h for h, d in seg.items() if _forecast_groups(d)[2] * 2 > sum(_forecast_groups(d))]
-    hit = [h for h in ("4시간", "12시간") if h in high]
-    stance, rule = ("축소", 1) if hit else ("관망", 2) if len(high) >= 2 else ("유지", 3)
-    return {"판단": stance, "맞은 기준": rule, "요동 예측 우세 구간": high, "축소 기준에 걸린 구간": hit,
+    share = {t: {"Q5": c["Q5"] / n, "Q4+Q5": (c["Q4"] + c["Q5"]) / n} for t, c in tables(seg).items() if (n := sum(c.values()))}
+    hit = [t for t in LONG if t in share and share[t]["Q5"] > P_SHRINK]
+    high = [t for t in share if share[t]["Q4+Q5"] > P_WATCH]
+    stance, rule = ("축소", 1) if hit else ("관망", 2) if high else ("유지", 3)
+    return {"판단": stance, "맞은 기준": rule, "요동 예측 우세 표": high, "축소 기준에 걸린 표": hit,
+            "표별 비율": {t: {k: round(v, 3) for k, v in d.items()} for t, d in share.items()},
+            "문턱": {"축소 Q5": P_SHRINK, "관망 Q4+Q5": P_WATCH},
             "구간별 전망": {h: level_word(d) for h, d in seg.items()},
             "참고: 직전 대비 방향": {h: direction(d) for h, d in seg.items()}}
 
@@ -228,7 +251,8 @@ def render_markdown(summary: dict, rep: dict) -> str:
         _table(["구간", "잔잔(Q1·Q2)", "보통(Q3)", "요동(Q4·Q5)"], [[h, *_regime_groups(d)] for h, d in seg.items()]), "",
         "## 2. 현재 전망", f"**{rep['outlook_conclusion'].strip()}**", "", *[f"- {x.strip()}" for x in rep["outlook_points"]], "",
         f"## 3. 판단: {det['판단']} (규칙 계산)",
-        f"맞은 기준: {det['맞은 기준']}번 · 평소보다 높을 예측이 과반인 구간: {', '.join(det['요동 예측 우세 구간']) or '없음'}", "",
+        f"맞은 기준: {det['맞은 기준']}번 · Q5 비율이 {P_SHRINK}보다 큰 긴 표: {', '.join(det['축소 기준에 걸린 표']) or '없음'} · "
+        f"Q4+Q5 비율이 {P_WATCH}보다 큰 표: {', '.join(det['요동 예측 우세 표']) or '없음'}", "",
         rep["stance_explanation"].strip(), "",
         "## 4. 유의점", *[f"- {x.strip()}" for x in rep["caveats"]],
         "- 판단은 정해진 기준을 코드로 계산한 값이고, 문장은 LLM이 그 계산을 설명한 것이다. 가격 방향은 다루지 않으며 투자 권유가 아니다.",
